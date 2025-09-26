@@ -11,6 +11,91 @@ if (!is_dir($notes_dir)) {
     mkdir($notes_dir, 0755, true);
 }
 
+// Table parsing function
+function parseMarkdownTables($text) {
+    $lines = explode("\n", $text);
+    $result = [];
+    $inTable = false;
+    $tableBuffer = [];
+    
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        
+        // Check if line looks like a table row (contains |)
+        if (preg_match('/^\s*\|.*\|\s*$/', $trimmed)) {
+            $tableBuffer[] = $line;
+            $inTable = true;
+        } else {
+            // If we were in a table and this line doesn't look like a table row
+            if ($inTable && count($tableBuffer) > 0) {
+                // Process the table and replace the buffer with HTML
+                $tableHtml = convertTableToHtml($tableBuffer);
+                // Add the table as a single block
+                $result[] = implode("\n", $tableHtml);
+                $tableBuffer = [];
+                $inTable = false;
+            }
+            // Only add non-empty lines or preserve intentional empty lines
+            if (!empty($trimmed) || !$inTable) {
+                $result[] = $line;
+            }
+        }
+    }
+    
+    // Process any remaining table at the end
+    if ($inTable && count($tableBuffer) > 0) {
+        $tableHtml = convertTableToHtml($tableBuffer);
+        $result[] = implode("\n", $tableHtml);
+    }
+    
+    return implode("\n", $result);
+}
+
+function convertTableToHtml($tableLines) {
+    if (count($tableLines) < 2) return $tableLines;
+    
+    $result = [];
+    $result[] = '<table class="markdown-table">';
+    
+    $headerProcessed = false;
+    
+    for ($i = 0; $i < count($tableLines); $i++) {
+        $line = trim($tableLines[$i]);
+        
+        // Skip separator lines (lines with only |, -, :, and spaces)
+        if (preg_match('/^\|\s*[-:]+\s*(\|\s*[-:]+\s*)*\|?\s*$/', $line)) {
+            continue;
+        }
+        
+        // Remove leading and trailing |
+        $line = trim($line, '| ');
+        $cells = explode('|', $line);
+        
+        // Clean up cells
+        $cells = array_map('trim', $cells);
+        
+        if (!$headerProcessed) {
+            // Header row
+            $result[] = '<thead><tr>';
+            foreach ($cells as $cell) {
+                $result[] = '<th>' . htmlspecialchars($cell) . '</th>';
+            }
+            $result[] = '</tr></thead><tbody>';
+            $headerProcessed = true;
+        } else {
+            // Data row
+            $result[] = '<tr>';
+            foreach ($cells as $cell) {
+                $result[] = '<td>' . htmlspecialchars($cell) . '</td>';
+            }
+            $result[] = '</tr>';
+        }
+    }
+    
+    $result[] = '</tbody></table>';
+    return $result;
+}
+
 // Simple markdown parser function
 function parseMarkdown($text) {
     // Headers
@@ -29,6 +114,9 @@ function parseMarkdown($text) {
     // Links
     $text = preg_replace('/\[([^\]]+)\]\(([^\)]+)\)/', '<a href="$2">$1</a>', $text);
     
+    // Tables
+    $text = parseMarkdownTables($text);
+    
     // Lists (nested support)
     $text = preg_replace('/^(\s*)[\*\-\+] (.+)$/m', '$1<li>$2</li>', $text);
     
@@ -36,7 +124,7 @@ function parseMarkdown($text) {
     $lines = explode("\n", $text);
     $result = [];
     $in_list = false;
-    $list_level = 0;
+    $list_levels = [];
     
     foreach ($lines as $line) {
         if (preg_match('/^(\s*)<li>/', $line, $matches)) {
@@ -45,40 +133,79 @@ function parseMarkdown($text) {
             if (!$in_list) {
                 $result[] = '<ul>';
                 $in_list = true;
-                $list_level = $current_level;
-            } elseif ($current_level > $list_level) {
-                $result[] = '<ul>';
-                $list_level = $current_level;
-            } elseif ($current_level < $list_level) {
-                for ($i = $list_level; $i > $current_level; $i--) {
-                    $result[] = '</ul>';
+                $list_levels = [$current_level];
+            } else {
+                $last_level = end($list_levels);
+                
+                if ($current_level > $last_level) {
+                    // Going deeper - add new ul
+                    $result[] = '<ul>';
+                    $list_levels[] = $current_level;
+                } elseif ($current_level < $last_level) {
+                    // Going up - close ul tags
+                    while (!empty($list_levels) && end($list_levels) > $current_level) {
+                        array_pop($list_levels);
+                        $result[] = '</ul>';
+                    }
                 }
-                $list_level = $current_level;
             }
             
-            $result[] = $line;
+            // Remove the spaces from the li tag for clean output
+            $result[] = trim($line);
         } else {
             if ($in_list) {
-                for ($i = 0; $i <= $list_level; $i++) {
+                // Close all open ul tags
+                while (!empty($list_levels)) {
+                    array_pop($list_levels);
                     $result[] = '</ul>';
                 }
                 $in_list = false;
-                $list_level = 0;
             }
             $result[] = $line;
         }
     }
     
     if ($in_list) {
-        for ($i = 0; $i <= $list_level; $i++) {
+        // Close any remaining open ul tags
+        while (!empty($list_levels)) {
+            array_pop($list_levels);
             $result[] = '</ul>';
         }
     }
     
     $text = implode("\n", $result);
     
-    // Line breaks
-    $text = nl2br($text);
+    // Line breaks (but not within list structures)
+    // First, protect list markup from nl2br
+    $text = preg_replace('/(<\/?ul>)\s*/', '$1', $text);
+    $text = preg_replace('/(<li>.*?<\/li>)\s*/', '$1', $text);
+    
+    // Apply nl2br but skip lines that are just list markup
+    $lines = explode("\n", $text);
+    $final_result = [];
+    
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '<ul>' || $trimmed === '</ul>' || preg_match('/^<li>.*<\/li>$/', $trimmed) || 
+            strpos($trimmed, '<table class="markdown-table">') === 0 || strpos($trimmed, '</table>') === 0 ||
+            preg_match('/^<t[rhd]|<\/t[rhd]|<thead|<\/thead>|<tbody|<\/tbody>/', $trimmed)) {
+            // Don't add br to list markup lines or table markup lines
+            $final_result[] = $line;
+        } else {
+            // Add br to content lines, but skip completely empty lines
+            if (!empty($trimmed)) {
+                $final_result[] = $line . '<br>';
+            } else {
+                $final_result[] = $line;
+            }
+        }
+    }
+    
+    $text = implode("\n", $final_result);
+    
+    // Clean up any double br tags and trailing brs
+    $text = preg_replace('/<br>\s*<br>/', '<br>', $text);
+    $text = preg_replace('/<br>\s*$/', '', $text);
     
     return $text;
 }
@@ -283,7 +410,7 @@ $view_mode = $_GET['mode'] ?? 'edit';
             padding: 20px;
             font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
             font-size: 14px;
-            line-height: 1.5;
+            line-height: 1;
             resize: vertical;
             outline: none;
         }
@@ -292,14 +419,14 @@ $view_mode = $_GET['mode'] ?? 'edit';
             padding: 20px;
             height: 500px;
             overflow-y: auto;
-            line-height: 1.3;
+            line-height: 1;
         }
         
         .preview h1, .preview h2, .preview h3 {
             margin-top: 12px;
             margin-bottom: 6px;
             color: #2c3e50;
-            line-height: 1.2;
+            line-height: 1;
         }
         
         .preview h1:first-child, .preview h2:first-child, .preview h3:first-child {
@@ -317,22 +444,26 @@ $view_mode = $_GET['mode'] ?? 'edit';
         }
         
         .preview p {
-            margin-bottom: 8px;
+            margin-bottom: 2px;
         }
         
         .preview ul {
-            margin-bottom: 8px;
-            padding-left: 18px;
+            margin-bottom: 2px;
+            margin-top: 0;
+            padding-left: 20px;
+            line-height: 1.6;
         }
         
         .preview ul ul {
             margin-bottom: 0;
             margin-top: 0;
+            padding-left: 20px;
         }
         
         .preview li {
-            margin-bottom: 0;
-            line-height: 1.2;
+            margin-bottom: 2px;
+            margin-top: 0;
+            line-height: 1.6;
         }
         
         .preview code {
@@ -348,8 +479,8 @@ $view_mode = $_GET['mode'] ?? 'edit';
             padding: 10px;
             border-radius: 5px;
             overflow-x: auto;
-            margin-bottom: 8px;
-            line-height: 1.2;
+            margin-bottom: 4px;
+            line-height: 1.4;
         }
         
         .preview pre code {
@@ -364,6 +495,35 @@ $view_mode = $_GET['mode'] ?? 'edit';
         
         .preview a:hover {
             text-decoration: underline;
+        }
+        
+        /* Table styling */
+        .preview .markdown-table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 0;
+            font-size: 14px;
+        }
+        
+        .preview .markdown-table th,
+        .preview .markdown-table td {
+            border: 1px solid #ddd;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        
+        .preview .markdown-table th {
+            background-color: #f8f9fa;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .preview .markdown-table tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        
+        .preview .markdown-table tr:hover {
+            background-color: #e9ecef;
         }
         
         .message {
@@ -413,6 +573,116 @@ $view_mode = $_GET['mode'] ?? 'edit';
         .full-width {
             grid-column: 1 / -1;
         }
+        
+        /* Autosave notification */
+        .autosave-notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #27ae60;
+            color: white;
+            padding: 12px 20px;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            font-size: 14px;
+            font-weight: 500;
+            z-index: 1000;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.3s ease;
+        }
+        
+        .autosave-notification.show {
+            opacity: 1;
+            transform: translateX(0);
+        }
+        
+        /* Search functionality */
+        .search-container {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+        }
+        
+        .search-input {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            width: 200px;
+            font-size: 14px;
+        }
+        
+        .search-panel {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        .search-panel .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .close-search {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0 5px;
+        }
+        
+        .search-results {
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .search-result-item {
+            border: 1px solid #e9ecef;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        
+        .search-result-item:hover {
+            background-color: #f8f9fa;
+        }
+        
+        .result-file-name {
+            font-weight: bold;
+            color: #3498db;
+            margin-bottom: 5px;
+        }
+        
+        .result-context {
+            color: #666;
+            font-size: 14px;
+            line-height: 1.4;
+        }
+        
+        .highlight {
+            background-color: #fff3cd;
+            padding: 1px 2px;
+            border-radius: 2px;
+            font-weight: bold;
+        }
+        
+        .no-results {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+        }
+        
+        @media (max-width: 767px) {
+            .search-input {
+                width: 150px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -433,8 +703,16 @@ $view_mode = $_GET['mode'] ?? 'edit';
                     <?php endforeach; ?>
                 </select>
                 
+                <div class="search-container">
+                    <input type="text" id="search-input" placeholder="Search all notes..." class="search-input">
+                    <button type="button" class="btn btn-secondary" onclick="toggleSearch()" id="search-toggle">Search</button>
+                </div>
+                
                 <a href="?file=<?= urlencode($file) ?>&mode=edit" class="btn btn-primary">Edit</a>
                 <a href="?file=<?= urlencode($file) ?>&mode=preview" class="btn btn-secondary">Preview Only</a>
+                
+                <button type="button" class="btn btn-secondary" onclick="undo()" title="Undo (Ctrl+Z)">Undo</button>
+                <button type="button" class="btn btn-secondary" onclick="redo()" title="Redo (Ctrl+Y)">Redo</button>
                 
                 <form method="post" style="display: inline;">
                     <button type="submit" name="delete" class="btn btn-danger" 
@@ -447,6 +725,17 @@ $view_mode = $_GET['mode'] ?? 'edit';
                     <input type="text" name="new_filename" placeholder="new-file-name" required>
                     <button type="submit" name="new_file" class="btn btn-success">New File</button>
                 </form>
+            </div>
+        </div>
+        
+        <!-- Search Results Panel -->
+        <div id="search-panel" class="search-panel" style="display: none;">
+            <div class="panel-header">
+                <span>Search Results</span>
+                <button class="close-search" onclick="toggleSearch()">×</button>
+            </div>
+            <div id="search-results" class="search-results">
+                <p class="no-results">Enter a search term to find notes</p>
             </div>
         </div>
         
@@ -484,10 +773,440 @@ $view_mode = $_GET['mode'] ?? 'edit';
         <?php endif; ?>
     </div>
     
+    <!-- Autosave notification -->
+    <div id="autosave-notification" class="autosave-notification">
+        <span id="autosave-message"></span>
+    </div>
+    
     <script>
         // Auto-save functionality
         let autoSaveTimer = null;
         let hasUnsavedChanges = false;
+        
+        // Undo/Redo system
+        let undoHistory = [];
+        let redoHistory = [];
+        let currentContent = '';
+        const MAX_HISTORY = 200;
+        let isUndoRedo = false;
+        
+        function saveToHistory(content) {
+            if (isUndoRedo) return; // Don't save history during undo/redo operations
+            
+            // Only save if content actually changed
+            if (content !== currentContent) {
+                undoHistory.push(currentContent);
+                
+                // Limit history size
+                if (undoHistory.length > MAX_HISTORY) {
+                    undoHistory.shift();
+                }
+                
+                // Clear redo history when new content is added
+                redoHistory = [];
+                currentContent = content;
+            }
+        }
+        
+        function undo() {
+            const textarea = document.querySelector('.editor');
+            if (!textarea || undoHistory.length === 0) return;
+            
+            isUndoRedo = true;
+            redoHistory.push(currentContent);
+            currentContent = undoHistory.pop();
+            textarea.value = currentContent;
+            
+            // Trigger preview update
+            textarea.dispatchEvent(new Event('input'));
+            hasUnsavedChanges = true;
+            scheduleAutoSave();
+            isUndoRedo = false;
+        }
+        
+        function redo() {
+            const textarea = document.querySelector('.editor');
+            if (!textarea || redoHistory.length === 0) return;
+            
+            isUndoRedo = true;
+            undoHistory.push(currentContent);
+            currentContent = redoHistory.pop();
+            textarea.value = currentContent;
+            
+            // Trigger preview update
+            textarea.dispatchEvent(new Event('input'));
+            hasUnsavedChanges = true;
+            scheduleAutoSave();
+            isUndoRedo = false;
+        }
+        
+        // Add keyboard shortcut for search (Ctrl+F) and other existing shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+                e.preventDefault();
+                undo();
+            } else if ((e.ctrlKey && e.key === 'y') || (e.ctrlKey && e.shiftKey && e.key === 'Z')) {
+                e.preventDefault();
+                redo();
+            } else if (e.ctrlKey && e.key === 'f') {
+                e.preventDefault();
+                if (!searchVisible) {
+                    toggleSearch();
+                }
+                if (searchVisible) {
+                    document.getElementById('search-input').select();
+                }
+            }
+        });
+        
+        // Smart auto-indentation for lists
+        function handleListIndentation(textarea, e) {
+            if (e.key === 'Enter') {
+                const cursorPos = textarea.selectionStart;
+                const textBeforeCursor = textarea.value.substring(0, cursorPos);
+                const lines = textBeforeCursor.split('\n');
+                const currentLine = lines[lines.length - 1];
+                
+                // Check if current line is a list item
+                const listMatch = currentLine.match(/^(\s*)([\*\-\+])\s(.*)$/);
+                if (listMatch) {
+                    const indent = listMatch[1]; // The spaces before the list marker
+                    const marker = listMatch[2]; // The list marker (*, -, or +)
+                    const content = listMatch[3]; // The content after the marker
+                    
+                    // If the list item is empty (no content after the marker)
+                    if (content.trim() === '') {
+                        e.preventDefault();
+                        
+                        const restOfText = textarea.value.substring(cursorPos);
+                        let newText = '';
+                        
+                        if (indent.length >= 2) {
+                            // Not at root level - outdent by removing 2 spaces
+                            const newIndent = indent.substring(2);
+                            newText = textBeforeCursor.substring(0, textBeforeCursor.length - currentLine.length) + 
+                                     newIndent + marker + ' ' + restOfText;
+                            
+                            // Position cursor after the outdented list marker
+                            const newCursorPos = cursorPos - currentLine.length + newIndent.length + 2; // +2 for "* "
+                            textarea.value = newText;
+                            textarea.selectionStart = textarea.selectionEnd = newCursorPos;
+                        } else {
+                            // At root level - remove list marker completely, just add new line
+                            newText = textBeforeCursor.substring(0, textBeforeCursor.length - currentLine.length) + 
+                                     '\n' + restOfText;
+                            
+                            // Position cursor at the beginning of the new line
+                            const newCursorPos = cursorPos - currentLine.length + 1; // +1 for \n
+                            textarea.value = newText;
+                            textarea.selectionStart = textarea.selectionEnd = newCursorPos;
+                        }
+                        
+                        // Trigger preview update
+                        textarea.dispatchEvent(new Event('input'));
+                        hasUnsavedChanges = true;
+                        scheduleAutoSave();
+                        
+                        return true;
+                    } else {
+                        // List item has content - continue with same indentation
+                        e.preventDefault();
+                        
+                        const restOfText = textarea.value.substring(cursorPos);
+                        
+                        // Insert new line with same indentation and list marker
+                        const newText = textBeforeCursor + '\n' + indent + marker + ' ' + restOfText;
+                        textarea.value = newText;
+                        
+                        // Position cursor after the new list marker
+                        const newCursorPos = cursorPos + 1 + indent.length + 2; // +1 for \n, +2 for "* "
+                        textarea.selectionStart = textarea.selectionEnd = newCursorPos;
+                        
+                        // Trigger preview update
+                        textarea.dispatchEvent(new Event('input'));
+                        hasUnsavedChanges = true;
+                        scheduleAutoSave();
+                        
+                        return true;
+                    }
+                }
+            } else if (e.key === 'Tab') {
+                const cursorPos = textarea.selectionStart;
+                const textBeforeCursor = textarea.value.substring(0, cursorPos);
+                const lines = textBeforeCursor.split('\n');
+                const currentLine = lines[lines.length - 1];
+                
+                // Check if current line is a list item
+                const listMatch = currentLine.match(/^(\s*)([\*\-\+])\s/);
+                if (listMatch) {
+                    e.preventDefault();
+                    
+                    if (e.shiftKey) {
+                        // Shift+Tab: Decrease indentation (remove 2 spaces)
+                        if (listMatch[1].length >= 2) {
+                            const newIndent = listMatch[1].substring(2);
+                            const lineStart = cursorPos - currentLine.length;
+                            const newLine = newIndent + listMatch[2] + currentLine.substring(listMatch[1].length + 1);
+                            
+                            textarea.value = textarea.value.substring(0, lineStart) + newLine + textarea.value.substring(cursorPos);
+                            textarea.selectionStart = textarea.selectionEnd = cursorPos - 2;
+                        }
+                    } else {
+                        // Tab: Increase indentation (add 2 spaces)
+                        const newIndent = listMatch[1] + '  ';
+                        const lineStart = cursorPos - currentLine.length;
+                        const newLine = newIndent + listMatch[2] + currentLine.substring(listMatch[1].length + 1);
+                        
+                        textarea.value = textarea.value.substring(0, lineStart) + newLine + textarea.value.substring(cursorPos);
+                        textarea.selectionStart = textarea.selectionEnd = cursorPos + 2;
+                    }
+                    
+                    // Trigger preview update
+                    textarea.dispatchEvent(new Event('input'));
+                    hasUnsavedChanges = true;
+                    scheduleAutoSave();
+                    
+                    return true;
+                }
+            }
+            return false;
+        }
+        
+        // Search functionality
+        let searchVisible = false;
+        let allFiles = <?= json_encode(array_values($files)) ?>;
+        
+        function toggleSearch() {
+            const panel = document.getElementById('search-panel');
+            const toggle = document.getElementById('search-toggle');
+            const input = document.getElementById('search-input');
+            
+            searchVisible = !searchVisible;
+            
+            if (searchVisible) {
+                panel.style.display = 'block';
+                toggle.textContent = 'Close Search';
+                input.focus();
+                if (input.value.trim()) {
+                    performSearch(input.value);
+                }
+            } else {
+                panel.style.display = 'none';
+                toggle.textContent = 'Search';
+            }
+        }
+        
+        function performSearch(query) {
+            if (query.length < 2) {
+                document.getElementById('search-results').innerHTML = '<p class="no-results">Enter at least 2 characters to search</p>';
+                return;
+            }
+            
+            const resultsContainer = document.getElementById('search-results');
+            resultsContainer.innerHTML = '<p class="no-results">Searching...</p>';
+            
+            // Search through all files
+            Promise.all(allFiles.map(fileName => 
+                fetch(`?file=${encodeURIComponent(fileName)}&mode=preview`)
+                    .then(response => response.text())
+                    .then(html => {
+                        // Extract content from HTML response
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+                        const contentElement = doc.querySelector('.preview');
+                        return { fileName, content: contentElement ? contentElement.textContent : '' };
+                    })
+                    .catch(() => ({ fileName, content: '' }))
+            )).then(files => {
+                const results = [];
+                const queryLower = query.toLowerCase();
+                
+                files.forEach(({ fileName, content }) => {
+                    const lines = content.split('\n').filter(line => line.trim());
+                    const matches = [];
+                    
+                    lines.forEach((line, index) => {
+                        const lineLower = line.toLowerCase();
+                        if (lineLower.includes(queryLower)) {
+                            // Get context (surrounding text)
+                            let context = line;
+                            if (context.length > 150) {
+                                const queryIndex = lineLower.indexOf(queryLower);
+                                const start = Math.max(0, queryIndex - 50);
+                                const end = Math.min(context.length, queryIndex + 100);
+                                context = '...' + context.substring(start, end) + '...';
+                            }
+                            
+                            matches.push({
+                                lineNumber: index + 1,
+                                context: highlightText(context, query)
+                            });
+                        }
+                    });
+                    
+                    if (matches.length > 0) {
+                        results.push({ fileName, matches });
+                    }
+                });
+                
+                displaySearchResults(results, query);
+            });
+        }
+        
+        function highlightText(text, query) {
+            const regex = new RegExp(`(${escapeRegExp(query)})`, 'gi');
+            return text.replace(regex, '<span class="highlight">$1</span>');
+        }
+        
+        function escapeRegExp(string) {
+            return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+        
+        function displaySearchResults(results, query) {
+            const container = document.getElementById('search-results');
+            
+            if (results.length === 0) {
+                container.innerHTML = `<p class="no-results">No results found for "${query}"</p>`;
+                return;
+            }
+            
+            let totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            let html = `<p style="margin-bottom: 15px; color: #666;"><strong>${totalMatches} results</strong> in <strong>${results.length} files</strong> for "${query}"</p>`;
+            
+            results.forEach(({ fileName, matches }) => {
+                html += `<div style="margin-bottom: 20px;">`;
+                html += `<h4 style="color: #3498db; margin-bottom: 10px; cursor: pointer;" onclick="openFile('${fileName}')">${fileName} (${matches.length} matches)</h4>`;
+                
+                matches.slice(0, 3).forEach(match => {
+                    html += `
+                        <div class="search-result-item" onclick="openFile('${fileName}')">
+                            <div class="result-context">${match.context}</div>
+                        </div>
+                    `;
+                });
+                
+                if (matches.length > 3) {
+                    html += `<p style="color: #666; font-size: 12px; margin-left: 15px;">... and ${matches.length - 3} more matches</p>`;
+                }
+                html += `</div>`;
+            });
+            
+            container.innerHTML = html;
+        }
+        
+        function openFile(fileName) {
+            window.location.href = `?file=${encodeURIComponent(fileName)}&mode=edit`;
+        }
+        
+        // Search input event listeners
+        document.addEventListener('DOMContentLoaded', function() {
+            const searchInput = document.getElementById('search-input');
+            let searchTimeout;
+            
+            if (searchInput) {
+                searchInput.addEventListener('input', function() {
+                    clearTimeout(searchTimeout);
+                    const query = this.value.trim();
+                    
+                    if (query.length === 0) {
+                        document.getElementById('search-results').innerHTML = '<p class="no-results">Enter a search term to find notes</p>';
+                        return;
+                    }
+                    
+                    // Debounce search to avoid too many requests
+                    searchTimeout = setTimeout(() => {
+                        performSearch(query);
+                    }, 300);
+                });
+                
+                searchInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        performSearch(this.value.trim());
+                    }
+                    if (e.key === 'Escape') {
+                        toggleSearch();
+                    }
+                });
+            }
+        });
+        
+        // Client-side table parsing
+        function parseClientTables(content) {
+            const lines = content.split('\n');
+            const result = [];
+            let inTable = false;
+            let tableBuffer = [];
+            
+            lines.forEach(line => {
+                const trimmed = line.trim();
+                
+                // Check if line looks like a table row (contains |)
+                if (/^\s*\|.*\|\s*$/.test(trimmed)) {
+                    tableBuffer.push(line);
+                    inTable = true;
+                } else {
+                    // If we were in a table and this line doesn't look like a table row
+                    if (inTable && tableBuffer.length > 0) {
+                        // Process the table and add as single block
+                        const tableHtml = convertClientTableToHtml(tableBuffer);
+                        result.push(tableHtml.join('\n'));
+                        tableBuffer = [];
+                        inTable = false;
+                    }
+                    // Only add non-empty lines or preserve intentional empty lines
+                    if (trimmed !== '' || !inTable) {
+                        result.push(line);
+                    }
+                }
+            });
+            
+            // Process any remaining table at the end
+            if (inTable && tableBuffer.length > 0) {
+                const tableHtml = convertClientTableToHtml(tableBuffer);
+                result.push(tableHtml.join('\n'));
+            }
+            
+            return result.join('\n');
+        }
+        
+        function convertClientTableToHtml(tableLines) {
+            if (tableLines.length < 2) return tableLines;
+            
+            const result = ['<table class="markdown-table">'];
+            
+            for (let i = 0; i < tableLines.length; i++) {
+                let line = tableLines[i].trim();
+                
+                // Skip separator lines (lines with only |, -, :, and spaces)
+                if (/^\|\s*[-:]+\s*(\|\s*[-:]+\s*)*\|?\s*$/.test(line)) {
+                    continue;
+                }
+                
+                // Remove leading and trailing |
+                line = line.replace(/^\||\|$/g, '').trim();
+                const cells = line.split('|').map(cell => cell.trim());
+                
+                if (i === 0) {
+                    // Header row
+                    result.push('<thead><tr>');
+                    cells.forEach(cell => {
+                        result.push(`<th>${cell}</th>`);
+                    });
+                    result.push('</tr></thead><tbody>');
+                } else {
+                    // Data row
+                    result.push('<tr>');
+                    cells.forEach(cell => {
+                        result.push(`<td>${cell}</td>`);
+                    });
+                    result.push('</tr>');
+                }
+            }
+            
+            result.push('</tbody></table>');
+            return result;
+        }
         
         function autoSave() {
             const textarea = document.querySelector('.editor');
@@ -504,11 +1223,41 @@ $view_mode = $_GET['mode'] ?? 'edit';
                 .then(() => {
                     hasUnsavedChanges = false;
                     console.log('Auto-saved');
+                    showAutosaveNotification();
                 })
                 .catch(error => {
                     console.error('Auto-save failed:', error);
+                    showAutosaveNotification(true); // Show error notification
                 });
             }
+        }
+        
+        function showAutosaveNotification(isError = false) {
+            const notification = document.getElementById('autosave-notification');
+            const message = document.getElementById('autosave-message');
+            const now = new Date();
+            const timestamp = now.toLocaleTimeString('en-US', { 
+                hour12: false, 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit' 
+            });
+            
+            if (isError) {
+                message.textContent = `Autosave failed at ${timestamp}`;
+                notification.style.background = '#e74c3c';
+            } else {
+                message.textContent = `Autosaved at ${timestamp}`;
+                notification.style.background = '#27ae60';
+            }
+            
+            // Show notification
+            notification.classList.add('show');
+            
+            // Hide after 2 seconds
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 2000);
         }
         
         function scheduleAutoSave() {
@@ -537,10 +1286,18 @@ $view_mode = $_GET['mode'] ?? 'edit';
             const preview = document.querySelector('#preview');
             
             if (textarea && preview) {
+                // Add smart list indentation
+                textarea.addEventListener('keydown', function(e) {
+                    handleListIndentation(this, e);
+                });
+                
                 // Set up auto-save on content change
                 textarea.addEventListener('input', function() {
                     hasUnsavedChanges = true;
                     scheduleAutoSave();
+                    
+                    // Save to undo history
+                    saveToHistory(this.value);
                     
                     // Simple client-side markdown preview update
                     let content = this.value;
@@ -554,21 +1311,48 @@ $view_mode = $_GET['mode'] ?? 'edit';
                     content = content.replace(/`(.*?)`/g, '<code>$1</code>');
                     content = content.replace(/\[([^\]]+)\]\(([^\)]+)\)/g, '<a href="$2">$1</a>');
                     
+                    // Handle tables
+                    content = parseClientTables(content);
+                    
                     // Handle nested lists
                     let lines = content.split('\n');
                     let result = [];
                     let inList = false;
+                    let listLevels = [];
                     
                     lines.forEach(line => {
-                        if (line.match(/^(\s*)[\*\-\+] (.+)$/)) {
+                        const listMatch = line.match(/^(\s*)[\*\-\+] (.+)$/);
+                        if (listMatch) {
+                            const currentLevel = Math.floor(listMatch[1].length / 2);
+                            
                             if (!inList) {
                                 result.push('<ul>');
                                 inList = true;
+                                listLevels = [currentLevel];
+                            } else {
+                                const lastLevel = listLevels[listLevels.length - 1];
+                                
+                                if (currentLevel > lastLevel) {
+                                    // Going deeper - add new ul
+                                    result.push('<ul>');
+                                    listLevels.push(currentLevel);
+                                } else if (currentLevel < lastLevel) {
+                                    // Going up - close ul tags
+                                    while (listLevels.length > 0 && listLevels[listLevels.length - 1] > currentLevel) {
+                                        listLevels.pop();
+                                        result.push('</ul>');
+                                    }
+                                }
                             }
-                            result.push(line.replace(/^(\s*)[\*\-\+] (.+)$/, '$1<li>$2</li>'));
+                            
+                            result.push('<li>' + listMatch[2] + '</li>');
                         } else {
                             if (inList) {
-                                result.push('</ul>');
+                                // Close all open ul tags
+                                while (listLevels.length > 0) {
+                                    listLevels.pop();
+                                    result.push('</ul>');
+                                }
                                 inList = false;
                             }
                             result.push(line);
@@ -576,14 +1360,44 @@ $view_mode = $_GET['mode'] ?? 'edit';
                     });
                     
                     if (inList) {
-                        result.push('</ul>');
+                        // Close any remaining open ul tags
+                        while (listLevels.length > 0) {
+                            listLevels.pop();
+                            result.push('</ul>');
+                        }
                     }
                     
                     content = result.join('\n');
-                    content = content.replace(/\n/g, '<br>');
+                    
+                    // Handle line breaks properly (avoid adding br to list markup and table markup)
+                    let finalLines = content.split('\n');
+                    let processedLines = [];
+                    
+                    finalLines.forEach(line => {
+                        const trimmed = line.trim();
+                        if (trimmed === '<ul>' || trimmed === '</ul>' || trimmed.match(/^<li>.*<\/li>$/) ||
+                            trimmed.startsWith('<table class="markdown-table">') || trimmed === '</table>' ||
+                            trimmed.match(/^<t[rhd]|<\/t[rhd]|<thead|<\/thead>|<tbody|<\/tbody>/)) {
+                            // Don't add br to list markup lines or table markup lines
+                            processedLines.push(line);
+                        } else if (trimmed !== '') {
+                            // Add br to non-empty content lines
+                            processedLines.push(line + '<br>');
+                        } else {
+                            // Keep empty lines as is
+                            processedLines.push(line);
+                        }
+                    });
+                    
+                    content = processedLines.join('\n');
                     
                     preview.innerHTML = content;
                 });
+                
+                // Initialize undo history with current content
+                currentContent = textarea.value;
+                undoHistory = [];
+                redoHistory = [];
                 
                 // Initial auto-save setup
                 scheduleAutoSave();
@@ -592,10 +1406,24 @@ $view_mode = $_GET['mode'] ?? 'edit';
             // Mobile auto-save setup
             const textarea = document.querySelector('.editor');
             if (textarea) {
+                // Add smart list indentation for mobile too
+                textarea.addEventListener('keydown', function(e) {
+                    handleListIndentation(this, e);
+                });
+                
                 textarea.addEventListener('input', function() {
                     hasUnsavedChanges = true;
                     scheduleAutoSave();
+                    
+                    // Save to undo history
+                    saveToHistory(this.value);
                 });
+                
+                // Initialize undo history with current content
+                currentContent = textarea.value;
+                undoHistory = [];
+                redoHistory = [];
+                
                 scheduleAutoSave();
             }
         }
