@@ -14,4 +14,4 @@ A generic notes app for my personal use
 - Undo and redo support
 - Runs on pure PHP, HTML, CSS and Javascript (so no dependencies)
 
-<img width="1175" height="876" alt="image" src="https://github.com/user-attachments/assets/e2b8e1bc-b16d-49d2-ab9c-12e2502a55a4" />
+![librewolf_tJfHV9ykzW](https://github.com/user-attachments/assets/3f7ec3e4-0ff7-4726-8b28-474ed8444f37)
