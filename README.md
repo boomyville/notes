@@ -13,3 +13,5 @@ A generic notes app for my personal use
 - Snapshots (version control)
 - Undo and redo support
 - Runs on pure PHP, HTML, CSS and Javascript (so no dependencies)
+
+<img width="1175" height="876" alt="image" src="https://github.com/user-attachments/assets/e2b8e1bc-b16d-49d2-ab9c-12e2502a55a4" />
