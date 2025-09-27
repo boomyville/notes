@@ -4,11 +4,18 @@
 
 // Configuration
 $notes_dir = 'notes';
+$snapshots_dir = 'snapshots';
 $default_file = 'welcome.md';
+$max_snapshots = 50;
 
 // Create notes directory if it doesn't exist
 if (!is_dir($notes_dir)) {
     mkdir($notes_dir, 0755, true);
+}
+
+// Create snapshots directory if it doesn't exist
+if (!is_dir($snapshots_dir)) {
+    mkdir($snapshots_dir, 0755, true);
 }
 
 // Table parsing function
@@ -49,6 +56,89 @@ function parseMarkdownTables($text) {
     }
     
     return implode("\n", $result);
+}
+
+// Snapshot management functions
+function saveSnapshot($file, $content) {
+    global $snapshots_dir, $max_snapshots;
+    
+    $filename = pathinfo($file, PATHINFO_FILENAME);
+    $file_snapshot_dir = $snapshots_dir . '/' . $filename;
+    
+    // Create file-specific snapshot directory
+    if (!is_dir($file_snapshot_dir)) {
+        mkdir($file_snapshot_dir, 0755, true);
+    }
+    
+    // Create snapshot filename with timestamp
+    $timestamp = date('Y-m-d_H-i-s');
+    $snapshot_file = $file_snapshot_dir . '/' . $timestamp . '.md';
+    
+    // Save the snapshot
+    if (file_put_contents($snapshot_file, $content) !== false) {
+        // Clean up old snapshots if we exceed the limit
+        cleanupOldSnapshots($file_snapshot_dir, $max_snapshots);
+        return true;
+    }
+    return false;
+}
+
+function cleanupOldSnapshots($snapshot_dir, $max_snapshots) {
+    $files = glob($snapshot_dir . '/*.md');
+    if (count($files) > $max_snapshots) {
+        // Sort by modification time (oldest first)
+        usort($files, function($a, $b) {
+            return filemtime($a) - filemtime($b);
+        });
+        
+        // Delete oldest files
+        $files_to_delete = array_slice($files, 0, count($files) - $max_snapshots);
+        foreach ($files_to_delete as $file) {
+            unlink($file);
+        }
+    }
+}
+
+function getSnapshots($file) {
+    global $snapshots_dir;
+    
+    $filename = pathinfo($file, PATHINFO_FILENAME);
+    $file_snapshot_dir = $snapshots_dir . '/' . $filename;
+    
+    if (!is_dir($file_snapshot_dir)) {
+        return [];
+    }
+    
+    $files = glob($file_snapshot_dir . '/*.md');
+    $snapshots = [];
+    
+    foreach ($files as $file_path) {
+        $basename = basename($file_path, '.md');
+        $timestamp = DateTime::createFromFormat('Y-m-d_H-i-s', $basename);
+        if ($timestamp) {
+            $snapshots[] = [
+                'file' => $file_path,
+                'timestamp' => $timestamp->format('Y-m-d H:i:s'),
+                'basename' => $basename,
+                'size' => filesize($file_path)
+            ];
+        }
+    }
+    
+    // Sort by timestamp (newest first)
+    usort($snapshots, function($a, $b) {
+        return strtotime($b['timestamp']) - strtotime($a['timestamp']);
+    });
+    
+    return $snapshots;
+}
+
+function restoreSnapshot($snapshot_file, $target_file) {
+    if (file_exists($snapshot_file)) {
+        $content = file_get_contents($snapshot_file);
+        return file_put_contents($target_file, $content) !== false;
+    }
+    return false;
 }
 
 function convertTableToHtml($tableLines) {
@@ -227,7 +317,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['save'])) {
         $content = $_POST['content'] ?? '';
         if (file_put_contents($file_path, $content) !== false) {
-            $message = 'File saved successfully!';
+            // Save snapshot for manual saves
+            if (saveSnapshot($file, $content)) {
+                $message = 'File saved and snapshot created!';
+            } else {
+                $message = 'File saved successfully!';
+            }
         } else {
             $message = 'Error saving file!';
         }
@@ -238,6 +333,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $file_path = $notes_dir . '/' . $file;
         } else {
             $message = 'Error deleting file!';
+        }
+    } elseif (isset($_POST['restore_snapshot'])) {
+        $snapshot_file = $_POST['snapshot_file'] ?? '';
+        if ($snapshot_file && file_exists($snapshot_file)) {
+            if (restoreSnapshot($snapshot_file, $file_path)) {
+                $message = 'Snapshot restored successfully!';
+                // Reload content after restoration
+                $content = file_get_contents($file_path);
+            } else {
+                $message = 'Error restoring snapshot!';
+            }
+        } else {
+            $message = 'Snapshot file not found!';
+        }
+    } elseif (isset($_POST['delete_all_snapshots'])) {
+        $filename = pathinfo($file, PATHINFO_FILENAME);
+        $file_snapshot_dir = $snapshots_dir . '/' . $filename;
+        
+        if (is_dir($file_snapshot_dir)) {
+            $snapshot_files = glob($file_snapshot_dir . '/*.md');
+            $deleted_count = 0;
+            
+            foreach ($snapshot_files as $snapshot_file) {
+                if (unlink($snapshot_file)) {
+                    $deleted_count++;
+                }
+            }
+            
+            // Remove empty directory
+            if (count(glob($file_snapshot_dir . '/*')) === 0) {
+                rmdir($file_snapshot_dir);
+            }
+            
+            $message = "Deleted {$deleted_count} snapshots successfully!";
+        } else {
+            $message = 'No snapshots found to delete!';
         }
     } elseif (isset($_POST['new_file'])) {
         $new_file = $_POST['new_filename'] ?? '';
@@ -640,6 +771,96 @@ $view_mode = $_GET['mode'] ?? 'edit';
             overflow-y: auto;
         }
         
+        /* Modal styles */
+        .modal {
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        
+        .modal-content {
+            background-color: white;
+            margin: 5% auto;
+            padding: 0;
+            border-radius: 8px;
+            width: 80%;
+            max-width: 600px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        
+        .modal-header {
+            background: #34495e;
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-header h3 {
+            margin: 0;
+            font-size: 18px;
+        }
+        
+        .close {
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            cursor: pointer;
+            background: none;
+            border: none;
+        }
+        
+        .close:hover {
+            color: #f39c12;
+        }
+        
+        .modal-body {
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .snapshots-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .snapshot-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            border: 1px solid #e9ecef;
+            border-radius: 5px;
+            background: #f8f9fa;
+        }
+        
+        .snapshot-info strong {
+            color: #2c3e50;
+            font-size: 14px;
+        }
+        
+        .snapshot-info small {
+            color: #7f8c8d;
+        }
+        
+        .snapshot-actions {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        
         .search-result-item {
             border: 1px solid #e9ecef;
             border-radius: 6px;
@@ -706,6 +927,7 @@ $view_mode = $_GET['mode'] ?? 'edit';
                 <div class="search-container">
                     <input type="text" id="search-input" placeholder="Search all notes..." class="search-input">
                     <button type="button" class="btn btn-secondary" onclick="toggleSearch()" id="search-toggle">Search</button>
+                    <button type="button" class="btn btn-warning" onclick="showSnapshots()" style="margin-left: 10px;">Snapshots</button>
                 </div>
                 
                 <a href="?file=<?= urlencode($file) ?>&mode=edit" class="btn btn-primary">Edit</a>
@@ -736,6 +958,55 @@ $view_mode = $_GET['mode'] ?? 'edit';
             </div>
             <div id="search-results" class="search-results">
                 <p class="no-results">Enter a search term to find notes</p>
+            </div>
+        </div>
+        
+        <!-- Snapshots Modal -->
+        <div id="snapshots-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>File Snapshots - <?= htmlspecialchars($file) ?></h3>
+                    <span class="close" onclick="closeSnapshots()">&times;</span>
+                </div>
+                <div class="modal-body">
+                    <?php $snapshots = getSnapshots($file); ?>
+                    <?php if (!empty($snapshots)): ?>
+                    <div style="text-align: right; margin-bottom: 15px;">
+                        <form method="post" style="display: inline;">
+                            <button type="submit" name="delete_all_snapshots" class="btn btn-sm btn-danger" 
+                                    onclick="return confirm('Are you sure you want to delete ALL snapshots for this file? This cannot be undone.')">
+                                Delete All Snapshots (<?= count($snapshots) ?>)
+                            </button>
+                        </form>
+                    </div>
+                    <?php endif; ?>
+                    
+                    <div id="snapshots-list">
+                        <?php
+                        if (empty($snapshots)) {
+                            echo '<p>No snapshots available for this file yet. Save the file to create your first snapshot!</p>';
+                        } else {
+                            echo '<div class="snapshots-grid">';
+                            foreach ($snapshots as $snapshot) {
+                                echo '<div class="snapshot-item">';
+                                echo '<div class="snapshot-info">';
+                                echo '<strong>' . htmlspecialchars($snapshot['timestamp']) . '</strong><br>';
+                                echo '<small>' . number_format($snapshot['size']) . ' bytes</small>';
+                                echo '</div>';
+                                echo '<div class="snapshot-actions">';
+                                echo '<form method="post" style="display: inline;">';
+                                echo '<input type="hidden" name="snapshot_file" value="' . htmlspecialchars($snapshot['file']) . '">';
+                                echo '<button type="submit" name="restore_snapshot" class="btn btn-sm btn-success" onclick="return confirm(\'Are you sure you want to restore this snapshot? This will overwrite the current file.\')">';
+                                echo 'Restore</button>';
+                                echo '</form>';
+                                echo '</div>';
+                                echo '</div>';
+                            }
+                            echo '</div>';
+                        }
+                        ?>
+                    </div>
+                </div>
             </div>
         </div>
         
@@ -1096,6 +1367,25 @@ $view_mode = $_GET['mode'] ?? 'edit';
         
         function openFile(fileName) {
             window.location.href = `?file=${encodeURIComponent(fileName)}&mode=edit`;
+        }
+        
+        // Snapshots functions
+        function showSnapshots() {
+            const modal = document.getElementById('snapshots-modal');
+            modal.style.display = 'block';
+        }
+        
+        function closeSnapshots() {
+            const modal = document.getElementById('snapshots-modal');
+            modal.style.display = 'none';
+        }
+        
+        // Close modal when clicking outside of it
+        window.onclick = function(event) {
+            const modal = document.getElementById('snapshots-modal');
+            if (event.target === modal) {
+                modal.style.display = 'none';
+            }
         }
         
         // Search input event listeners
