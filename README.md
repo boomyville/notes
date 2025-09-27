@@ -10,5 +10,6 @@ A generic notes app for my personal use
 - Empty list auto-outdentation by pressing [Enter] twice on empty list items to outdent or exit lists
 - Table support
 - Search
+- Snapshots (version control)
 - Undo and redo support
 - Runs on pure PHP, HTML, CSS and Javascript (so no dependencies)
